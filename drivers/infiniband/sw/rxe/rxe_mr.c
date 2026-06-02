@@ -224,6 +224,67 @@ err2:
 	return err;
 }
 
+int rxe_mr_init_dmabuf(struct rxe_dev *rxe, u64 offset,
+		       u64 length, u64 iova, int fd,
+		       int access, struct rxe_mr *mr)
+{
+	struct ib_umem_dmabuf *umem_dmabuf;
+	struct net_device *ndev;
+	struct ib_umem *umem;
+	int err;
+
+	if (!IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING))
+		return -EOPNOTSUPP;
+
+	ndev = rxe_ib_device_get_netdev(&rxe->ib_dev);
+	if (!ndev)
+		return -ENODEV;
+
+	rxe_mr_init(access, mr);
+
+	rxe_dbg_mr(mr, "ndev=%s parent=%p dma_device=%p\n",
+		   netdev_name(ndev),
+		   ndev->dev.parent,
+		   rxe->ib_dev.dma_device);
+
+	umem_dmabuf = ib_umem_dmabuf_get_pinned_with_dma_device(
+				&rxe->ib_dev, ndev->dev.parent,
+				offset, length, fd, access);
+	dev_put(ndev);
+	if (IS_ERR(umem_dmabuf)) {
+		rxe_dbg_mr(mr, "Unable to get dmabuf umem err = %d\n",
+			   (int)PTR_ERR(umem_dmabuf));
+		return PTR_ERR(umem_dmabuf);
+	}
+
+	umem = &umem_dmabuf->umem;
+
+	/* ib_umem_dmabuf_map_pages sets nents but not orig_nents */
+	umem->sgt_append.sgt.orig_nents = umem->sgt_append.sgt.nents;
+
+	err = alloc_mr_page_info(mr, ib_umem_num_pages(umem));
+	if (err)
+		goto err_release;
+
+	err = rxe_mr_fill_pages_from_sgt(mr, &umem->sgt_append.sgt);
+	if (err)
+		goto err_free_pages;
+
+	mr->umem = umem;
+	mr->ibmr.iova = iova;
+	mr->ibmr.length = length;
+	mr->ibmr.type = IB_MR_TYPE_USER;
+	mr->state = RXE_MR_STATE_VALID;
+
+	return 0;
+
+err_free_pages:
+	free_mr_page_info(mr);
+err_release:
+	ib_umem_release(umem);
+	return err;
+}
+
 int rxe_mr_init_fast(int max_pages, struct rxe_mr *mr)
 {
 	int err;
